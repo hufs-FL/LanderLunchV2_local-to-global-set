@@ -2,6 +2,8 @@ import gym
 import os
 import argparse
 import cv2
+import numpy as np
+import time
 from agent import Agent
 from constants import *
 import matplotlib.pyplot as plt
@@ -9,6 +11,72 @@ import pandas as pd
 
 
 ENV = "LunarLander-v2"
+
+
+#성능 지표 저장
+def save_single_local_metrics(scores, average_rewards, convergence_episode, convergence_step, convergence_time, agent_name, filename="single_local_metrics.csv"):
+    avg_reward = np.mean(scores)
+    avg_episode = convergence_episode
+    avg_step = convergence_step
+    avg_time = convergence_time
+
+    # 전체 성능 통계 저장
+    summary = {
+        'avg_reward': [avg_reward], # 전체 학습 평균 보상
+        'avg_episode': [avg_episode], 
+        'avg_step': [avg_step], 
+        'avg_time': [avg_time]
+    }
+
+    # 각 에피소드 마다 성능 변화 저장
+    metrics = {
+        'Episode': list(range(len(scores))),
+        'Score': scores,
+        'Average Reward': average_rewards,
+        'Convergence Episode': [convergence_episode] * len(scores),
+        'Convergence Step': [convergence_step] * len(scores),
+        'Convergence Time': [convergence_time] * len(scores)
+    }
+
+    # 요약 통계와 개별 성능을 각각 데이터프레임으로 변환
+    summary_df = pd.DataFrame(summary).round(3)
+    metrics_df = pd.DataFrame(metrics)
+
+    filename = f"{agent_name}_{filename}"
+    with open(filename, 'w') as f:
+        summary_df.to_csv(f, index=False)
+        f.write('\n')  # 빈 줄로 구분
+        metrics_df.to_csv(f, index=False)
+    
+    print(f"[INFO] 단일 연합 로컬 성능 데이터가 {filename}에 저장되었습니다.")
+
+
+def plot_single_local_performance(scores, average_rewards, convergence_episode, convergence_step, convergence_time):
+    plt.figure(figsize=(10, 6))
+    plt.plot(scores, label='Score', color='blue', alpha=0.5)
+    plt.plot(average_rewards, label='Mean Episode Reward', color='orange', linewidth=2)
+    if convergence_episode != -1:
+        plt.axvline(x=convergence_episode, color='green', linestyle='--', label=f'Convergence at Ep {convergence_episode}')
+        plt.text(convergence_episode, max(scores), f'Step: {convergence_step}\nTime: {convergence_time:.2f}s', color='green')
+    plt.title("Fed Single Local Training Performance")
+    plt.xlabel("Episode")
+    plt.ylabel("Reward")
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+
+def measure_single_local_performance(scores, average_rewards, convergence_episode, convergence_step, convergence_time, agent_name):
+    save_single_local_metrics(
+        scores=scores,
+        average_rewards=average_rewards,
+        convergence_episode=convergence_episode,
+        convergence_step=convergence_step,
+        convergence_time=convergence_time,
+        agent_name=agent_name
+    )
+    # 성능 시각화
+    plot_single_local_performance(scores, average_rewards, convergence_episode, convergence_step, convergence_time)
 
 def run(params):
     env = gym.make(ENV)
@@ -27,13 +95,21 @@ def run(params):
         agent.load_model()
         
     average_reward, best_avg = 0, -1000
-    scores, eps_history = [], []
+    scores, eps_history, average_rewards = [], [], []
     
     n_games = params['n_games']
     n_steps = 0
     limit_steps = params['limit_steps']
     scores_window = params['scores_window']
     
+    # 수렴 속도 설정
+    convergence_episode = -1
+    convergence_step = -1
+    convergence_time = -1 
+
+    start_time = time.time()
+
+
     for i in range(n_games):
         score = 0
         obs = env.reset()
@@ -47,7 +123,7 @@ def run(params):
             i_step += 1
             # Reward Punishing for Moving Vertically away from zero
             # Range is [-1.00 to +1.00] with center at zero to maximize efficiency
-            reward -= abs(obs[0])*0.05
+            reward -= abs(obs[0])*0.05  # =========================
             score += reward
             
             if not params['test_mode']:
@@ -71,6 +147,8 @@ def run(params):
         eps_history.append(agent.epsilon)
 
         average_reward = sum(scores[-scores_window:])/len(scores[-scores_window:])
+        average_rewards.append(average_reward)
+
         min_reward = min(scores[-scores_window:])
         max_reward = max(scores[-scores_window:])
 
@@ -81,8 +159,32 @@ def run(params):
                 agent.save_model()
                 best_avg = average_reward
                 print('\rEpisode: {:4n}\tAverage Score: {:.2f}\tEpsilon: {:.4f}'.format(i, average_reward, agent.epsilon))
+    
+         # 수렴 속도 계산
+        if len(scores) >= 100:
+            # 최근 100개의 에피소드 평균 계산
+            recent_avg = np.mean(scores[-100:])
+            if recent_avg >= 200 and convergence_episode == -1:
+                convergence_episode = i
+                convergence_step = n_steps
+                convergence_time = time.time() - start_time
+                print(f"[INFO] 수렴 도달: {convergence_episode}번째 에피소드에서 평균 보상 {recent_avg:.2f}점 초과")
+                print(f"[INFO] 수렴 스텝: {convergence_step}, 수렴 시간: {convergence_time:.2f}초")
+
+        agent.on_epsiode_end(reward_avg=average_reward, reward_min=min_reward, reward_max=max_reward, n_steps=n_steps, i_steps=i_step)
+    
     if not params['test_mode']:
         agent.tensorboard_writer.close()
+
+    measure_single_local_performance(
+        scores=scores,
+        average_rewards=average_rewards,
+        convergence_episode=convergence_episode,
+        convergence_step=convergence_step,
+        convergence_time=convergence_time,
+        agent_name=agent.agent_name
+    )
+    
     env.close()
     
     if params['test_mode']:

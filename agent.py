@@ -5,6 +5,7 @@ import threading
 import json
 import requests
 import time
+import uuid
 
 
 import torch as T
@@ -55,6 +56,10 @@ class Agent():
         agent_ = '{}-'.format(self.agent_mode) if self.agent_mode!=SIMPLE else ''
         network_ = '{}-'.format(self.network_mode) if self.network_mode!=SIMPLE else ''
         self.agent_name = f'{agent_}{network_}DQN'.strip()
+
+        base_name = f"{self.agent_mode}-{self.network_mode}-DQN"
+        self.client_id  = f"{base_name}-{uuid.uuid4()}"
+        self.agent_name = base_name   
         
         if network_mode==DUELING:
             self.Q_eval = DuelingDeepQNetwork(input_dims=input_dims, n_actions=n_actions, seed=seed, lr=lr, fc1_dims=fc1_dims, fc2_dims=fc2_dims)
@@ -143,7 +148,7 @@ class Agent():
                 try:
                     sd = self.Q_eval.state_dict()
                     sd_json = {k: v.detach().cpu().numpy().tolist() for k, v in sd.items()}
-                    payload = {"client_id": self.agent_name, "state_dict": sd_json}
+                    payload = {"client_id": self.client_id,  "state_dict": sd_json}
                     requests.post(self.weights_url, json=payload, timeout=5)
                 except Exception as e:
                     print(f"[ERROR] Weights upload failed: {e}")
@@ -235,11 +240,15 @@ class Agent():
                 q_next = self.Q_next.forward(next_states).to(self.Q_eval.device)
             self.Q_eval.train()
             q_target = rewards + \
-                        self.gamma*q_next.gather(1, max_actions)*(1.0 - dones)
+                self.gamma*q_next.gather(1, max_actions)*(1.0 - dones)
         else:
             # DQN Approach
             q_target_next = self.Q_next.forward(next_states).to(self.Q_eval.device).detach().max(dim=1)[0].unsqueeze(1)
-            q_target = rewards + (self.gamma* q_target_next * (1 - dones))
+            # q_target = rewards + (self.gamma* q_target_next * (1 - dones))
+            # Use torch.mul() to avoid in-place operation issues
+            gamma_term = T.mul(self.gamma, q_target_next)
+            done_term = T.mul(gamma_term, (1 - dones))
+            q_target = T.add(rewards, done_term)
 
         # Training
         for epoch in range(self.n_epochs):
