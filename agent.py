@@ -255,7 +255,7 @@ class Agent():
             q_eval = self.Q_eval.forward(states).to(self.Q_eval.device).gather(1, actions)
             loss = self.Q_eval.loss(q_eval, q_target).to(self.Q_eval.device)
             self.Q_eval.optimizer.zero_grad()
-            loss.backward()
+            loss.backward(retain_graph=True)
             self.Q_eval.optimizer.step()
 
         # Replace Target Network
