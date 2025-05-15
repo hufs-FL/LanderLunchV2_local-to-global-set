@@ -26,8 +26,8 @@ class DeepQNetwork(nn.Module):
         self.loss = nn.MSELoss()
 
     def forward(self, state):
-        x = F.relu(self.fc1(state))
-        x = F.relu(self.fc2(x))
+        x = F.relu(self.fc1(state), inplace=False)
+        x = F.relu(self.fc2(x), inplace=False)
         actions = self.fc3(x)
 
         return actions
@@ -67,6 +67,8 @@ class DuelingDeepQNetwork(nn.Module):
         # We construct Q from V and A
         # V is scalar that shifts A by a scalar quantity
         # Subtract of Mean of Advantage
-        Q = V + (A - A.mean(dim=1, keepdim=True))
+        A_mean = A.mean(dim=1, keepdim=True)
+        A_centered = A - A_mean  # 명시적으로 새 변수에 할당
+        Q = V + A_centered
 
         return Q

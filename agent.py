@@ -24,8 +24,8 @@ class Agent():
                  max_mem_size=1_00_000, tau=1e-3,    
                  # 글로벌 전송 인자 추가 부 -----------------------------
                  # 글로벌 전송 관련 인자
-                 upload_interval_sec=200.0,
-                 download_interval_sec=210.0,
+                 upload_interval_sec=15.0,
+                 download_interval_sec=40.0,
                 #  trans_url="http://192.168.50.64:5050/upload-transition",
                 #  weights_url="http://192.168.50.64:5050/upload-weights",
                 #  download_url="http://192.168.50.64:5050/download-params",
@@ -51,6 +51,9 @@ class Agent():
         self.eps_dec = eps_dec
         self.mem_size = max_mem_size
         self.tau = tau
+
+        self.pending_download = None
+
         
         # For naming purpose
         agent_ = '{}-'.format(self.agent_mode) if self.agent_mode!=SIMPLE else ''
@@ -156,7 +159,42 @@ class Agent():
                 self.current_transitions.clear()
                 self.last_upload_time = now
 
-    #파라미터 업데이트
+    # #파라미터 업데이트
+    # def _periodic_download(self):
+    #     while True:
+    #         time.sleep(1.0)
+    #         if time.time() - self.last_download_time < self.download_interval:
+    #             continue
+
+    #         try:
+    #             resp = requests.get(self.download_url, timeout=5)
+    #             resp.raise_for_status()
+    #             payload = resp.json()
+    #             sd_json = payload['state_dict']
+
+    #             if not sd_json:
+    #                 print("[WARN] 다운로드된 state_dict 가 비어 있습니다.")
+    #             else:
+    #                 state_dict = self.Q_eval.state_dict()
+    #                 with T.no_grad():
+
+    #                     for k, v in sd_json.items():
+    #                         if k in state_dict:
+    #                             state_dict[k] = T.tensor(v, dtype=T.float32)
+
+    #                     self.Q_eval.load_state_dict(state_dict)
+    #                     self.Q_next.load_state_dict(state_dict)
+
+    #                 self.Q_eval.train()
+    #                 self.Q_next.train()
+
+    #                 print(f"[SYNC] Downloaded & loaded global params at {time.ctime()}")
+    #                 print("successful weight update")
+    #         except Exception as e:
+    #             print(f"[ERROR] Param download failed: {e}")
+
+    #         self.last_download_time = time.time()
+
     def _periodic_download(self):
         while True:
             time.sleep(1.0)
@@ -167,31 +205,40 @@ class Agent():
                 resp = requests.get(self.download_url, timeout=5)
                 resp.raise_for_status()
                 payload = resp.json()
-                #  반드시 payload['state_dict'] 로 꺼내야 함.
                 sd_json = payload['state_dict']
-                # print("sd_json dict print line cheakpoint : ----------",sd_json)
-                # sd_json 이 빈 dict 라면 로그를 남기고 건너뛰도록
+
                 if not sd_json:
                     print("[WARN] 다운로드된 state_dict 가 비어 있습니다.")
                 else:
-                    # Python list → torch.Tensor 로
-                    state_dict = {
-                        k: T.tensor(v, dtype=T.float32)
-                        for k, v in sd_json.items()
-                    }
-                    # 모델에 로드
-                    self.Q_eval.load_state_dict(state_dict)
-                    self.Q_next.load_state_dict(state_dict)
-                    print(f"[SYNC] Downloaded & loaded global params at {time.ctime()}")
-                    print("successful weight update")
+                    # 파라미터를 곧바로 적용하지 않고 보류 상태로 저장
+                    self.pending_download = sd_json
+                    print(f"[SYNC] 파라미터 다운로드 완료 (적용 대기) at {time.ctime()}")
+
             except Exception as e:
                 print(f"[ERROR] Param download failed: {e}")
 
             self.last_download_time = time.time()
 
+
+    # def step(self, state, action, reward, next_state, done):
+    #     if not self.test_mode:
+    #         self.memory.add(state, action, reward, next_state, done)
+    #     self.current_transitions.append({
+    #         "state": state.tolist() if hasattr(state, 'tolist') else state,
+    #         "action": int(action),
+    #         "reward": float(reward),
+    #         "next_state": next_state.tolist() if hasattr(next_state, 'tolist') else next_state,
+    #         "done": bool(done)
+    #     })
+    #     self.update_cntr    = (self.update_cntr    + 1) % self.update_every
+    #     if self.update_cntr    == 0 and len(self.memory) > self.batch_size:
+    #         experiences = self.memory.sample()
+    #         self.learn(experiences)
+    
     def step(self, state, action, reward, next_state, done):
         if not self.test_mode:
             self.memory.add(state, action, reward, next_state, done)
+
         self.current_transitions.append({
             "state": state.tolist() if hasattr(state, 'tolist') else state,
             "action": int(action),
@@ -199,11 +246,27 @@ class Agent():
             "next_state": next_state.tolist() if hasattr(next_state, 'tolist') else next_state,
             "done": bool(done)
         })
-        self.update_cntr    = (self.update_cntr    + 1) % self.update_every
-        if self.update_cntr    == 0 and len(self.memory) > self.batch_size:
+
+        # 안전한 시점에서 글로벌 파라미터 적용
+        if hasattr(self, 'pending_download') and self.pending_download:
+            with T.no_grad():
+                state_dict = self.Q_eval.state_dict()
+                for k, v in self.pending_download.items():
+                    if k in state_dict:
+                        state_dict[k] = T.tensor(v, dtype=T.float32)
+                self.Q_eval.load_state_dict(state_dict)
+                self.Q_next.load_state_dict(state_dict)
+            self.pending_download = None
+            self.Q_eval.train()
+            self.Q_next.train()
+            print(f"[SYNC] 글로벌 파라미터를 안전하게 적용함 at {time.ctime()}")
+
+        self.update_cntr = (self.update_cntr + 1) % self.update_every
+        if self.update_cntr == 0 and len(self.memory) > self.batch_size:
             experiences = self.memory.sample()
             self.learn(experiences)
-    
+
+
     def replace_target_network(self):
         if self.update_every != 0 and self.update_cntr % self.update_every == 0:
             # Soft Update
@@ -226,39 +289,80 @@ class Agent():
     def epsilon_decay(self):
         self.epsilon = max(self.epsilon*self.eps_dec, self.eps_end)
     
+    # def learn(self, samples):
+    #     T.autograd.set_detect_anomaly(True)
+
+    #     states, actions, rewards, next_states, dones = samples
+
+    #     if self.agent_mode == DOUBLE:
+    #         # Double DQN Approach
+    #         self.Q_eval.eval()
+    #         with T.no_grad():
+    #             # Q_Eval over next states to fetch max action arguement to pass to q_next
+    #             q_pred = self.Q_eval.forward(next_states).to(self.Q_eval.device)
+    #             max_actions = T.argmax(q_pred, dim=1).long().unsqueeze(1)
+    #             # Q_Target over next states from actions will be taken based on q_pred's max_actions
+    #             q_next = self.Q_next.forward(next_states).to(self.Q_eval.device)
+    #         self.Q_eval.train()
+    #         q_target = rewards + \
+    #             self.gamma*q_next.gather(1, max_actions)*(1.0 - dones)
+    #     else:
+    #         # DQN Approach
+    #         q_target_next = self.Q_next.forward(next_states).to(self.Q_eval.device).detach().max(dim=1)[0].unsqueeze(1)
+    #         # q_target = rewards + (self.gamma* q_target_next * (1 - dones))
+    #         # Use torch.mul() to avoid in-place operation issues
+    #         gamma_term = T.mul(self.gamma, q_target_next)
+    #         done_term = T.mul(gamma_term, (1 - dones))
+    #         q_target = T.add(rewards, done_term)
+
+    #     # Training
+    #     for epoch in range(self.n_epochs):
+    #         q_eval = self.Q_eval.forward(states).to(self.Q_eval.device).gather(1, actions)
+    #         loss = self.Q_eval.loss(q_eval, q_target).to(self.Q_eval.device)
+    #         self.Q_eval.optimizer.zero_grad()
+    #         loss.backward()
+    #         self.Q_eval.optimizer.step()
+
+    #     # Replace Target Network
+    #     self.replace_target_network()
+
     def learn(self, samples):
+        T.autograd.set_detect_anomaly(True)
+
+        # 안전하게 먼저 디바이스로 이동
         states, actions, rewards, next_states, dones = samples
-        
+        device = self.Q_eval.device
+
+        states      = states.to(device)
+        actions     = actions.to(device)
+        rewards     = rewards.to(device)
+        next_states = next_states.to(device)
+        dones       = dones.to(device)
+        # print(states.requires_grad, rewards.requires_grad) 
+
         if self.agent_mode == DOUBLE:
-            # Double DQN Approach
+            # Double DQN
             self.Q_eval.eval()
             with T.no_grad():
-                # Q_Eval over next states to fetch max action arguement to pass to q_next
-                q_pred = self.Q_eval.forward(next_states).to(self.Q_eval.device)
+                q_pred = self.Q_eval.forward(next_states)
                 max_actions = T.argmax(q_pred, dim=1).long().unsqueeze(1)
-                # Q_Target over next states from actions will be taken based on q_pred's max_actions
-                q_next = self.Q_next.forward(next_states).to(self.Q_eval.device)
+                q_next = self.Q_next.forward(next_states)
             self.Q_eval.train()
-            q_target = rewards + \
-                self.gamma*q_next.gather(1, max_actions)*(1.0 - dones)
+            q_target = rewards + self.gamma * q_next.gather(1, max_actions) * (1.0 - dones)
         else:
-            # DQN Approach
-            q_target_next = self.Q_next.forward(next_states).to(self.Q_eval.device).detach().max(dim=1)[0].unsqueeze(1)
-            # q_target = rewards + (self.gamma* q_target_next * (1 - dones))
-            # Use torch.mul() to avoid in-place operation issues
-            gamma_term = T.mul(self.gamma, q_target_next)
-            done_term = T.mul(gamma_term, (1 - dones))
-            q_target = T.add(rewards, done_term)
+            # DQN
+            q_target_next = self.Q_next.forward(next_states).detach()
+            q_target_next = q_target_next.max(dim=1)[0].unsqueeze(1)
+            q_target = rewards + self.gamma * q_target_next * (1.0 - dones)
 
-        # Training
+        # Training step
         for epoch in range(self.n_epochs):
-            q_eval = self.Q_eval.forward(states).to(self.Q_eval.device).gather(1, actions)
-            loss = self.Q_eval.loss(q_eval, q_target).to(self.Q_eval.device)
+            q_eval = self.Q_eval.forward(states).gather(1, actions)
+            loss = self.Q_eval.loss(q_eval, q_target)
             self.Q_eval.optimizer.zero_grad()
-            loss.backward(retain_graph=True)
+            loss.backward()
             self.Q_eval.optimizer.step()
 
-        # Replace Target Network
         self.replace_target_network()
 
 
