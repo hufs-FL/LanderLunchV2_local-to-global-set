@@ -13,22 +13,30 @@ import pandas as pd
 ENV = "LunarLander-v2"
 
 
-#성능 지표 저장
-def save_single_local_metrics(scores, average_rewards, convergence_episode, convergence_step, convergence_time, agent_name, filename="single_local_metrics.csv"):
+def save_single_local_metrics(scores, average_rewards, convergence_episode, convergence_step, convergence_time, agent_name, agent, filename="single_local_metrics.csv"):
     avg_reward = np.mean(scores)
     avg_episode = convergence_episode
     avg_step = convergence_step
     avg_time = convergence_time
 
-    # 전체 성능 통계 저장
+    flops_per_step = estimate_flops_per_forward(agent)
+    steps_total = avg_step * avg_episode
+    flops_per_episode = flops_per_step * avg_step
+    total_flops = flops_per_step * steps_total
+    reward_per_flops = avg_reward / total_flops if total_flops > 0 else 0.0
+
+
     summary = {
-        'avg_reward': [avg_reward], # 전체 학습 평균 보상
+        'avg_reward': [avg_reward],
         'avg_episode': [avg_episode], 
         'avg_step': [avg_step], 
-        'avg_time': [avg_time]
+        'avg_time': [avg_time],
+        'flops_per_step': [flops_per_step],
+        'flops_per_episode': [flops_per_episode],
+        'total_flops': [total_flops],
+        'reward_per_flops': [reward_per_flops]
     }
 
-    # 각 에피소드 마다 성능 변화 저장
     metrics = {
         'Episode': list(range(len(scores))),
         'Score': scores,
@@ -38,17 +46,17 @@ def save_single_local_metrics(scores, average_rewards, convergence_episode, conv
         'Convergence Time': [convergence_time] * len(scores)
     }
 
-    # 요약 통계와 개별 성능을 각각 데이터프레임으로 변환
     summary_df = pd.DataFrame(summary).round(3)
     metrics_df = pd.DataFrame(metrics)
 
     filename = f"{agent_name}_{filename}"
     with open(filename, 'w') as f:
         summary_df.to_csv(f, index=False)
-        f.write('\n')  # 빈 줄로 구분
+        f.write('\n')
         metrics_df.to_csv(f, index=False)
-    
+
     print(f"[INFO] 단일 연합 로컬 성능 데이터가 {filename}에 저장되었습니다.")
+
 
 
 def plot_single_local_performance(scores, average_rewards, convergence_episode, convergence_step, convergence_time):
@@ -65,15 +73,34 @@ def plot_single_local_performance(scores, average_rewards, convergence_episode, 
     plt.grid(True)
     plt.show()
 
+def estimate_flops_per_forward(agent):
+    fc1_dims = agent.Q_eval.fc1_dims
+    fc2_dims = agent.Q_eval.fc2_dims
+    input_dims = agent.input_dims[0]
+    n_actions = agent.n_actions
 
-def measure_single_local_performance(scores, average_rewards, convergence_episode, convergence_step, convergence_time, agent_name):
+    # 일반 DQN 구조 FLOPs
+    flops_fc1 = input_dims * fc1_dims * 2
+    flops_fc2 = fc1_dims * fc2_dims * 2
+
+    if agent.network_mode == DUELING:
+        # dueling은 fc2 이후 두 개의 출력 (V + A)
+        flops_output = fc2_dims * 1 * 2 + fc2_dims * n_actions * 2
+    else:
+        # 일반 DQN은 마지막 하나
+        flops_output = fc2_dims * n_actions * 2
+
+    return flops_fc1 + flops_fc2 + flops_output
+
+def measure_single_local_performance(scores, average_rewards, convergence_episode, convergence_step, convergence_time, agent_name,agent):
     save_single_local_metrics(
         scores=scores,
         average_rewards=average_rewards,
         convergence_episode=convergence_episode,
         convergence_step=convergence_step,
         convergence_time=convergence_time,
-        agent_name=agent_name
+        agent_name=agent_name,
+        agent=agent
     )
     # 성능 시각화
     plot_single_local_performance(scores, average_rewards, convergence_episode, convergence_step, convergence_time)
@@ -182,7 +209,8 @@ def run(params):
         convergence_episode=convergence_episode,
         convergence_step=convergence_step,
         convergence_time=convergence_time,
-        agent_name=agent.agent_name
+        agent_name=agent.agent_name,
+        agent=agent
     )
     
     env.close()
