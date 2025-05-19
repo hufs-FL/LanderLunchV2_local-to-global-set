@@ -6,6 +6,9 @@ import json
 import requests
 import time
 import uuid
+import gzip
+import base64
+import pickle
 
 
 import torch as T
@@ -90,6 +93,17 @@ class Agent():
         self.weights_url = weights_url
         self.current_transitions = []
         self.last_upload_time = time.time()
+        
+        # 통신 성능 지표 저장 
+        self.perf_metrics = {
+            'rtt_times': [],
+            'processing_times': [],
+            'total_times': [],
+            'data_sizes': [],
+            'throughputs': [],
+            'failures': 0,
+            'sync_count': 0
+        }
 
         # 다운로드 설정
         self.download_interval = download_interval_sec
@@ -147,11 +161,21 @@ class Agent():
                        requests.post(self.trans_url, json=self.current_transitions, timeout=5)
                     except Exception as e:
                         print(f"[ERROR] Transition upload failed: {e}")
+                        
+                # 파라미터 압축코드 
+                def compress_weights(state_dict):
+                    """state_dict를 압축하고 base64로 인코딩"""
+                    pickled = pickle.dumps(state_dict)
+                    compressed = gzip.compress(pickled, compresslevel=6)
+                    encoded = base64.b64encode(compressed).decode('utf-8')
+                    return encoded
+                
                 # weights 업로드
                 try:
                     sd = self.Q_eval.state_dict()
                     sd_json = {k: v.detach().cpu().numpy().tolist() for k, v in sd.items()}
-                    payload = {"client_id": self.client_id,  "state_dict": sd_json}
+                    weights_base64 = compress_weights(sd_json)
+                    payload = {"client_id": self.client_id,  "weights_base64": weights_base64}
                     requests.post(self.weights_url, json=payload, timeout=5)
                 except Exception as e:
                     print(f"[ERROR] Weights upload failed: {e}")
@@ -202,20 +226,57 @@ class Agent():
                 continue
 
             try:
+                # 지연 시간 측정 시작
+                start_time = time.time()
+                
+                # 데이터 크기 측정을 위한 설정
+                req_start = time.time()
                 resp = requests.get(self.download_url, timeout=5)
+                req_end = time.time()
+                
                 resp.raise_for_status()
                 payload = resp.json()
-                sd_json = payload['state_dict']
-
+                sd_json = payload['state_dict']  # 또는 'weights'로 수정
+                
+                # 데이터 크기 계산 (bytes)
+                data_size = len(json.dumps(payload).encode('utf-8'))
+                
                 if not sd_json:
                     print("[WARN] 다운로드된 state_dict 가 비어 있습니다.")
                 else:
-                    # 파라미터를 곧바로 적용하지 않고 보류 상태로 저장
-                    self.pending_download = sd_json
-                    print(f"[SYNC] 파라미터 다운로드 완료 (적용 대기) at {time.ctime()}")
-
+                    # 처리 시간 측정
+                    process_start = time.time()
+                    state_dict = {
+                        k: T.tensor(v, dtype=T.float32) if not isinstance(v, T.Tensor) else v
+                        for k, v in sd_json.items()
+                    }
+                    self.Q_eval.load_state_dict(state_dict)
+                    self.Q_next.load_state_dict(state_dict)
+                    process_end = time.time()
+                    
+                    # 총 지연 시간
+                    total_time = time.time() - start_time
+                    
+                    # 성능 측정값 저장
+                    if hasattr(self, 'perf_metrics'):
+                        self.perf_metrics['rtt_times'].append((req_end - req_start)*1000)
+                        self.perf_metrics['processing_times'].append((process_end - process_start)*1000)
+                        self.perf_metrics['total_times'].append(total_time*1000)
+                        self.perf_metrics['data_sizes'].append(data_size/1024)
+                        self.perf_metrics['throughputs'].append((data_size/1024)/(total_time))
+                        self.perf_metrics['sync_count'] += 1
+                    
+                # 동기화 횟수 카운터 증가
+                self.sync_count = getattr(self, 'sync_count', 0) + 1
+                
             except Exception as e:
+                # 실패 카운터 증가
+                self.sync_failures = getattr(self, 'sync_failures', 0) + 1
                 print(f"[ERROR] Param download failed: {e}")
+                if self.perf_metrics['sync_count'] + self.perf_metrics['failures'] > 0:
+                    failure_rate = (self.perf_metrics['failures'] / 
+                                (self.perf_metrics['failures'] + self.perf_metrics['sync_count'])) * 100
+                print(f"[PERF] Failure Rate: {(self.sync_failures/(self.sync_failures+self.sync_count))*100:.2f}%")
 
             self.last_download_time = time.time()
 
@@ -333,12 +394,12 @@ class Agent():
         states, actions, rewards, next_states, dones = samples
         device = self.Q_eval.device
 
-        states      = states.to(device)
-        actions     = actions.to(device)
-        rewards     = rewards.to(device)
-        next_states = next_states.to(device)
-        dones       = dones.to(device)
-        # print(states.requires_grad, rewards.requires_grad) 
+        # detach()를 사용하여 계산 그래프에서 분리된 새로운 텐서 생성
+        states = states.clone().detach().to(device)
+        actions = actions.clone().detach().to(device)
+        rewards = rewards.clone().detach().to(device)
+        next_states = next_states.clone().detach().to(device)
+        dones = dones.clone().detach().to(device)
 
         if self.agent_mode == DOUBLE:
             # Double DQN
@@ -348,23 +409,31 @@ class Agent():
                 max_actions = T.argmax(q_pred, dim=1).long().unsqueeze(1)
                 q_next = self.Q_next.forward(next_states)
             self.Q_eval.train()
-            q_target = rewards + self.gamma * q_next.gather(1, max_actions) * (1.0 - dones)
+            
+            # 인플레이스 연산 대신 새 텐서 생성
+            q_next_gathered = q_next.gather(1, max_actions)
+            q_target = rewards + self.gamma * q_next_gathered * (1.0 - dones)
         else:
             # DQN
-            q_target_next = self.Q_next.forward(next_states).detach()
-            q_target_next = q_target_next.max(dim=1)[0].unsqueeze(1)
-            q_target = rewards + self.gamma * q_target_next * (1.0 - dones)
+            with T.no_grad():
+                q_target_next = self.Q_next.forward(next_states)
+                q_target_max = q_target_next.max(dim=1)[0].unsqueeze(1)
+                q_target = rewards + self.gamma * q_target_max * (1.0 - dones)
 
         # Training step
         for epoch in range(self.n_epochs):
+            # 이전 결과를 완전히 분리시킴
+            self.Q_eval.optimizer.zero_grad()
+            
+            # 새로운 순전파 계산
             q_eval = self.Q_eval.forward(states).gather(1, actions)
             loss = self.Q_eval.loss(q_eval, q_target)
-            self.Q_eval.optimizer.zero_grad()
+            
+            # 역전파 및 옵티마이저 업데이트
             loss.backward()
             self.Q_eval.optimizer.step()
 
         self.replace_target_network()
-
 
     # #  글로벌 전송 헬퍼 메서드
     # def _filter_transitions(self, transitions):
@@ -399,3 +468,61 @@ class Agent():
                 print(f"[ERROR] Failed to send transitions: {e}")
 
         threading.Thread(target=_send, daemon=True).start() 
+        
+    # ----------- 통신 성능 최종 계산 ------------
+    def calculate_performance_summary(self):
+        """학습 종료 시 호출하여 통신 성능 요약 계산"""
+        if not hasattr(self, 'perf_metrics') or not self.perf_metrics.get('sync_count'):
+            print("[WARN] 성능 측정 데이터가 없습니다.")
+            return {}
+        
+        # 측정값이 있는 경우만 평균 계산
+        summary = {}
+        
+        if self.perf_metrics['rtt_times']:
+            summary['avg_rtt_ms'] = sum(self.perf_metrics['rtt_times']) / len(self.perf_metrics['rtt_times'])
+        
+        if self.perf_metrics['processing_times']:
+            summary['avg_processing_ms'] = sum(self.perf_metrics['processing_times']) / len(self.perf_metrics['processing_times'])
+        
+        if self.perf_metrics['total_times']:
+            summary['avg_total_time_ms'] = sum(self.perf_metrics['total_times']) / len(self.perf_metrics['total_times'])
+        
+        if self.perf_metrics['throughputs']:
+            summary['avg_throughput_kbps'] = sum(self.perf_metrics['throughputs']) / len(self.perf_metrics['throughputs'])
+        
+        # 동기화 횟수와 실패율
+        summary['total_syncs'] = self.perf_metrics['sync_count']
+        total_attempts = self.perf_metrics['sync_count'] + self.perf_metrics['failures']
+        
+        if total_attempts > 0:
+            summary['failure_rate_pct'] = (self.perf_metrics['failures'] / total_attempts) * 100
+        else:
+            summary['failure_rate_pct'] = 0
+        
+        # 학습 시간이 있는 경우 동기화 빈도 계산
+        if hasattr(self, 'train_time') and self.train_time > 0:
+            summary['sync_frequency_per_min'] = self.perf_metrics['sync_count'] / (self.train_time / 60)
+        
+        # 성능 점수 계산 (낮은 지연시간, 높은 처리량, 낮은 실패율이 좋은 점수)
+        if 'avg_total_time_ms' in summary and 'avg_throughput_kbps' in summary and 'failure_rate_pct' in summary:
+            score = (
+                (1000 / max(summary['avg_total_time_ms'], 10)) * 0.4 +  # 지연시간 역수 (작을수록 좋음)
+                (summary['avg_throughput_kbps'] / 500) * 0.4 +          # 처리량 (클수록 좋음)
+                ((100 - summary['failure_rate_pct']) / 100) * 0.2        # 성공률 (높을수록 좋음)
+            ) * 100  # 0-100 점수로 정규화
+            
+            summary['performance_score'] = min(max(score, 0), 100)  # 0-100 사이로 제한
+        
+        print("\n===== 통신 성능 요약 =====")
+        
+        for metric, value in summary.items():
+            if metric.endswith(('ms', 'pct', 'kbps')):
+                print(f"{metric}: {value:.2f}")
+            else:
+                print(f"{metric}: {value}")
+        
+        if 'performance_score' in summary:
+            print(f"종합 성능 점수: {summary['performance_score']:.2f}/100")
+        
+        return summary

@@ -1,0 +1,9 @@
+metric,value
+avg_rtt_ms,10.76866520775689
+avg_processing_ms,0.7057454850938585
+avg_total_time_ms,14.427555931939018
+avg_throughput_kbps,7658.327040441787
+total_syncs,18.0
+failure_rate_pct,0.0
+sync_frequency_per_min,1.4508472630712526
+performance_score,100.0

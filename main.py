@@ -135,6 +135,18 @@ def run(params):
     convergence_time = -1 
 
     start_time = time.time()
+    agent.start_time = time.time()  # 에이전트에 시작 시간 저장
+
+    # 성능 지표 저장을 위한 변수 초기화
+    agent.perf_metrics = {
+        'rtt_times': [],
+        'processing_times': [],
+        'total_times': [],
+        'data_sizes': [],
+        'throughputs': [],
+        'failures': 0,
+        'sync_count': 0
+    }
 
 
     for i in range(n_games):
@@ -202,6 +214,27 @@ def run(params):
     
     if not params['test_mode']:
         agent.tensorboard_writer.close()
+    
+    #----------------통신 최종 성능 저장---------------
+    if not params['test_mode']:
+        # 학습 시간 기록
+        agent.train_time = time.time() - agent.start_time
+        
+        # 통신 성능 요약 계산 및 저장
+        if hasattr(agent, 'calculate_performance_summary'):
+            comm_summary = agent.calculate_performance_summary()
+            
+            # 통신 성능 데이터를 CSV로 저장
+            if comm_summary:
+                comm_metrics_df = pd.DataFrame({
+                    'metric': list(comm_summary.keys()),
+                    'value': list(comm_summary.values())
+                })
+                
+                comm_filename = f"{agent.agent_name}_communication_metrics.csv"
+                comm_metrics_df.to_csv(comm_filename, index=False)
+                print(f"[INFO] 통신 성능 데이터가 {comm_filename}에 저장되었습니다.")
+
 
     measure_single_local_performance(
         scores=scores,
